@@ -9,16 +9,48 @@ import random
 # TODO: Write summary
 # TODO: Rewrite modularly
 
-class ReplayBuffer(torch.utils.data.Dataset):
-    def __init__(self, images, labels):
-        self.images = images
-        self.labels = labels
+class TensorWrapper(torch.utils.data.Dataset):
+    """Wrap dataset t return tensors for images and labels"""
+    def __init__(self, dataset, device="cpu", transform=None):
+        self.dataset = dataset
+        self.device = device
+        self.transform = transform
 
     def __len__(self):
-        return len(self.images)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.images[idx], self.labels[idx]
+        img, lbl = self.dataset[idx]
+        if self.transform and not torch.is_tensor(img):
+            img = self.transform(img)
+        elif not torch.is_tensor(img):
+            img = transforms.ToTensor()(img)
+        
+        lbl = torch.tensor(lbl, dtype=torch.long)
+        return img.to(self.device), lbl.to(self.device)
+
+
+class ReplayBuffer(torch.utils.data.Dataset):
+    def __init__(self, images, labels, device="cpu"):
+        if not torch.is_tensor(images):
+            self.images = torch.as_tensor(images, dtype=torch.float32, device=device)
+        else:
+            self.images = images.to(dtype=torch.float32, device=device)
+
+        if not torch.is_tensor(labels):
+            self.labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+        else:
+            self.labels = labels.to(dtype=torch.long, device=device)
+
+    def __len__(self):
+        return self.images.shape[0]
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        lbl = self.labels[idx]
+        if not torch.is_tensor(lbl):
+            lbl = torch.tensor(lbl, dtype=torch.long)
+        return img, lbl
 
 
 # Basic residual block
@@ -128,95 +160,116 @@ def resnet18(classes = 1000):
     return ResNet(BasicBlock, [2,2,2,2], classes)
 
 
-# Settings
-classes_per_task = 2
-memory_size = 2000 # Replay  buffer
-batch_size = 32
-lr = 0.001
-tasks = 5 # 10 classes in total
+def main():
+    # Settings
+    classes_per_task = 2
+    memory_size = 2000 # Replay  buffer
+    batch_size = 32
+    lr = 0.001
+    tasks = 5 # 10 classes in total
 
-transform = transforms.Compose([
-    transforms.Resize((32, 32)),
-    transforms.ToTensor()
-])
+    transform = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.ToTensor()
+    ])
 
-# Example with CIFAR-10
-full_dataset = datasets.CIFAR10(root = "./data", train=True, download=True, transform=transform)
-test_dataset = datasets.CIFAR10(root = "./data", train=False, download=True, transform=transform)
+    # Example with CIFAR-10
+    full_dataset = datasets.CIFAR10(root = "./data", train=True, download=True, transform=transform)
+    test_dataset = datasets.CIFAR10(root = "./data", train=False, download=True, transform=transform)
 
-# Model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-resnet = models.resnet18(pretrained=False)
-feature_extractor = nn.Sequential(
-    resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-    resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4,
-    resnet.avgpool
-)
-model = IncrementalResNet(feature_extractor)
-model = model.to(device)
-
-criterion = nn.CrossEntropyLoss()
-optimiser = optim.SGD(model.parameters(), lr=lr, momentum = 0.9)
-
-# Replay memory
-memory_data = []
-memory_labels = []
-
-# Incremental learning loop
-for task in range(tasks):
-    # Select classes for this task
-    classes = list(range(task * classes_per_task, (task + 1) * classes_per_task))
-    idx = [i for i, (_, label) in enumerate(full_dataset) if label in classes]
-    task_dataset = Subset(full_dataset, idx)
-
-    # Extend layer for new classes
-    model.add_classes(len(classes))
+    resnet = models.resnet18(pretrained=False)
+    feature_extractor = nn.Sequential(
+        resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+        resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4,
+        resnet.avgpool
+    )
+    model = IncrementalResNet(feature_extractor)
     model = model.to(device)
-    optmiser = optim.SGD(model.parameters(), lr = lr, momentum = 0.9)
 
-    # Use replay buffer
-    if memory_data:
-        memory_dataset = ReplayBuffer(memory_data, memory_labels)
-        train_loader = DataLoader(
-            ConcatDataset([task_dataset, memory_dataset]),
-            batch_size = batch_size,
-            shuffle = True
-        )
-    else:
-        train_loader = DataLoader(task_dataset, batch_size = batch_size, shuffle = True)
+    criterion = nn.CrossEntropyLoss()
+    optimiser = optim.SGD(model.parameters(), lr=lr, momentum = 0.9)
 
+    # Replay memory
+    memory_data = []
+    memory_labels = []
+    len_seen = 0
 
-    # Training
-    model.train()
-    for epoch in range(5):
-        for images, labels in train_loader:
+    # Incremental learning loop
+    for task in range(tasks):
+        # Select classes for this task
+        classes = list(range(task * classes_per_task, (task + 1) * classes_per_task))
+        idx = [i for i, (_, label) in enumerate(full_dataset) if label in classes]
+        task_dataset = Subset(full_dataset, idx)
+        task_dataset_tensor = TensorWrapper(task_dataset, device=device, transform=transform)
+
+        # Extend layer for new classes
+        model.add_classes(len(classes))
+        model = model.to(device)
+        optmiser = optim.SGD(model.parameters(), lr = lr, momentum = 0.9)
+
+        # Use replay buffer
+        if memory_data:
+            memory_images = torch.stack(memory_data)
+            memory_labels_tensor = torch.tensor(memory_labels, dtype=torch.long)
+            memory_dataset = ReplayBuffer(memory_images, memory_labels_tensor, device)
+
+            train_loader = DataLoader(
+                ConcatDataset([task_dataset_tensor, memory_dataset]),
+                batch_size = batch_size,
+                shuffle = True,
+                pin_memory = True,
+                num_workers = 4
+            )
+        else:
+            train_loader = DataLoader(task_dataset_tensor, batch_size = batch_size, shuffle = True,
+                pin_memory = True, num_workers = 4)
+
+        # Training
+        model.train()
+        for epoch in range(5):
+            for images, labels in train_loader:
+                images, labels = images.to(device), labels.to(device)
+                optimiser.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimiser.step()
+
+        # Update memory via random sampling
+        model.eval()
+        with torch.no_grad():
+            for images, labels in DataLoader(task_dataset, batch_size=1, shuffle=True):
+                img = images.squeeze(0).cpu()
+                lbl = labels.item()
+                len_seen += 1
+
+                if len(memory_data) < memory_size:
+                    memory_data.append(img)
+                    memory_labels.append(lbl)
+                else:
+                    # Reservoir sampling: replace exising memory with probability
+                    idx_replace = random.randint(0, len_seen-1)
+                    if idx_replace < memory_size:
+                        memory_data[idx_replace] = img
+                        memory_labels[idx_replace] = lbl
+
+    # Evaluation
+    model.eval()
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
-            optimiser.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimiser.step()
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
-    # Update memory via random sampling
-    for img, lbl in DataLoader(task_dataset, batch_size=1, shuffle=True):
-        if len(memory_data) >= memory_size:
-            break
-        memory_data.append(img.squeeze(0))
-        memory_labels.append(lbl.item())
+    print(f"Accuracy on all classes: {correct / total:.4f}")
 
-    print(f"Finished training task: {task + 1} / {tasks}")
 
-# Evaluation
-model.eval()
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-correct, total = 0, 0
-with torch.no_grad():
-    for images, labels in test_loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-print(f"Accuracy on all classes: {correct / total:.4f}")
+if __name__ == "__main__":
+    main()
